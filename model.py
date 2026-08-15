@@ -1,143 +1,157 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import Block_size, N_emb, N_head, N_layer, Dropout, Device
+
+from config import Block_size, Dropout, N_emb, N_head, N_layer
 
 
 class Head(nn.Module):
-    """Single causal: self:attention head"""
+    """One causal self-attention head."""
 
-    def __init__(self, head_size):
+    def __init__(self, n_emb, head_size, block_size, dropout):
         super().__init__()
-        self.key = nn.Linear(N_emb, head_size, bias=False)
-        self.query = nn.Linear(N_emb, head_size, bias=False)
-        self.value = nn.Linear(N_emb, head_size, bias=False)
-        
-        self.register_buffer("tril", torch.tril(torch.ones(Block_size, Block_size)))
-        self.dropout = nn.Dropout(Dropout)
-
+        self.key = nn.Linear(n_emb, head_size, bias=False)
+        self.query = nn.Linear(n_emb, head_size, bias=False)
+        self.value = nn.Linear(n_emb, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
+        _, time_steps, _ = x.shape
+        key = self.key(x)
+        query = self.query(x)
+        value = self.value(x)
 
-        B,T,C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        v = self.value(x)
-        dim = k.shape[-1] 
-
-        attn = q @ k.transpose(-2, -1) / (dim ** 0.5)
-
-        attn.attn.masked_fill(
-            self.tril[:T, :T] == 0, float("-inf"),
+        attention = query @ key.transpose(-2, -1) / (key.shape[-1] ** 0.5)
+        attention = attention.masked_fill(
+            self.tril[:time_steps, :time_steps] == 0,
+            float("-inf"),
         )
+        attention = F.softmax(attention, dim=-1)
+        attention = self.dropout(attention)
+        return attention @ value
 
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
 
-        out = attn @ v
-        return out
-    
 class MultiHeadAttention(nn.Module):
-    """Multiple heads in parallel, then project back to N_emb"""
+    """Run several attention heads in parallel and project their outputs."""
 
-
-    def __init__(self, num_heads, head_size):
+    def __init__(self, n_emb, num_heads, block_size, dropout):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(N_emb, N_emb) #projection after concatination
-        self.dropout = nn.Dropout(Dropout)
+        head_size = n_emb // num_heads
+        self.heads = nn.ModuleList(
+            [Head(n_emb, head_size, block_size, dropout) for _ in range(num_heads)]
+        )
+        self.proj = nn.Linear(n_emb, n_emb)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
+        combined = torch.cat([head(x) for head in self.heads], dim=-1)
+        return self.dropout(self.proj(combined))
+
 
 class FeedForward(nn.Module):
-    """"position-wise FFN: Linear-ReLu-Linear, with 4x inner dimension"""
+    """Position-wise feed-forward network with a 4x hidden dimension."""
 
-
-    def __init__(self):
+    def __init__(self, n_emb, dropout):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(N_emb, 4 * N_emb),
+            nn.Linear(n_emb, 4 * n_emb),
             nn.ReLU(),
-            nn.Linear(4 * N_emb, N_emb),
-            nn.Dropout(Dropout),
+            nn.Linear(4 * n_emb, n_emb),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
         return self.net(x)
-    
 
 
-
-    
 class Block(nn.Module):
-    """
-    One transformer decoder block:
-        x +=  MultiheadAttention(LayerNorm(x))  : communication step
-        x += FeedForward(LayerNorm(x)) : computation step
+    """A pre-LayerNorm transformer decoder block."""
 
-    Nore: LayerNorm is applied BEFORE each sublayer (Pre-LN)
-    The original paper used Post-LN but pre-LN trains more stably (why?)
-    """
-
-    def __init__(self):
+    def __init__(self, n_emb, n_head, block_size, dropout):
         super().__init__()
-        head_size = N_emb // N_head
-        self.attn = MultiHeadAttention(N_head, head_size)
-        self.ff = FeedForward()
-        self.ln1 = nn.LayerNorm(N_emb)
-        self.ln2 = nn.LayerNorm(N_emb)
+        self.attn = MultiHeadAttention(n_emb, n_head, block_size, dropout)
+        self.ff = FeedForward(n_emb, dropout)
+        self.ln1 = nn.LayerNorm(n_emb)
+        self.ln2 = nn.LayerNorm(n_emb)
 
     def forward(self, x):
-        x += self.attn(self.ln1(x))
-        x += self.ff(self.ln2(x))
+        x = x + self.attn(self.ln1(x))
+        x = x + self.ff(self.ln2(x))
         return x
-    
-
 
 
 class GPT(nn.Module):
-
-    def __init__(self, vocab_size):
+    def __init__(
+        self,
+        vocab_size,
+        block_size=Block_size,
+        n_emb=N_emb,
+        n_head=N_head,
+        n_layer=N_layer,
+        dropout=Dropout,
+    ):
         super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, N_emb)
-        self.pos_emb = nn.Embedding(Block_size,  N_emb)
-        self.blocks = nn.Sequential(*[Block() for _ in range(N_layer)])
-        self.ln_final = nn.LayerNorm(N_emb)
-        self.head = nn.Linear(N_emb, vocab_size, bias=False)
+        if n_emb % n_head != 0:
+            raise ValueError("n_emb must be divisible by n_head")
 
+        self.block_size = block_size
+        self.model_config = {
+            "block_size": block_size,
+            "n_emb": n_emb,
+            "n_head": n_head,
+            "n_layer": n_layer,
+            "dropout": dropout,
+        }
+        self.token_emb = nn.Embedding(vocab_size, n_emb)
+        self.pos_emb = nn.Embedding(block_size, n_emb)
+        self.blocks = nn.Sequential(
+            *[
+                Block(n_emb, n_head, block_size, dropout)
+                for _ in range(n_layer)
+            ]
+        )
+        self.ln_final = nn.LayerNorm(n_emb)
+        self.head = nn.Linear(n_emb, vocab_size, bias=False)
 
     def forward(self, idx, targets=None):
-        B, T = idx.shape
-        tok = self.token_emb(idx)          # (B, T, N_emb)
-        pos = self.pos_emb(torch.arange(T, device=Device)) # (T, N_emb)
-        x = tok + pos
+        batch_size, time_steps = idx.shape
+        if time_steps == 0:
+            raise ValueError("idx must contain at least one token")
+        if time_steps > self.block_size:
+            raise ValueError(
+                f"sequence length {time_steps} exceeds block size {self.block_size}"
+            )
+
+        token_embeddings = self.token_emb(idx)
+        positions = torch.arange(time_steps, device=idx.device)
+        position_embeddings = self.pos_emb(positions)
+        x = token_embeddings + position_embeddings
         x = self.blocks(x)
-        x = self.ln_final(x)
-        logits = self.head(x)
+        logits = self.head(self.ln_final(x))
 
         loss = None
         if targets is not None:
-            B, T, C = logits.shape
-            loss = F.cross_entropy(logits.view(B*T, C), targets.view(B*T))
-
-        return logits, loss            
-
+            _, _, vocab_size = logits.shape
+            loss = F.cross_entropy(
+                logits.reshape(batch_size * time_steps, vocab_size),
+                targets.reshape(batch_size * time_steps),
+            )
+        return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_token, temperature=1.0):
-        """Autoregressive generation: idx is (B,T) of current context"""
+    def generate(self, idx, max_new_tokens, temperature=1.0):
+        """Generate tokens autoregressively from a non-empty context."""
+        if temperature <= 0:
+            raise ValueError("temperature must be greater than zero")
+        if idx.shape[1] == 0:
+            raise ValueError("generation context must contain at least one token")
 
-        for _ in range(max_new_token):
-            idx_cond = idx[:, -Block_size:]
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.block_size :]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
-            probs = F.softmax(logits, dim=-1)
-            next_tok = torch.multinomial(probs, num_samples=1) #(B, 1)
-            idx = torch.cat([idx, next_tok], dim=1)
-
+            probabilities = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probabilities, num_samples=1)
+            idx = torch.cat([idx, next_token], dim=1)
         return idx
-    
-    

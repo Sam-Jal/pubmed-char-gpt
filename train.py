@@ -2,6 +2,8 @@ import torch
 from config import *
 from model import GPT
 
+torch.manual_seed(Seed)
+
 # ------------------------------------------------------------------
 # Load corpus and build vocabulary
 # ------------------------------------------------------------------
@@ -86,5 +88,6 @@ torch.save({
     "stoi"       : stoi,
     "itos"       : itos,
     "vocab_size" : vocab_size,
+    "model_config": model.model_config,
 }, "checkpoint.pt")
 print("Checkpoint saved.")

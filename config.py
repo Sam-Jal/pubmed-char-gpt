@@ -22,6 +22,7 @@ Eval_interval = 500
 Eval_iters = 200
 Learning_rate = 3e-4
 Grad_clip = 1.0
+Seed = 1337
 
 #device
 Device = "cuda" if torch.cuda.is_available() else "cpu"
